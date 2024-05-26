@@ -17,7 +17,7 @@ The project consists of two main components: encryption and decryption. It uses 
    ```sh
    go get github.com/joho/godotenv
 
-3. Create a `.env` file in the project root directory with the following content:
+3. Create a `.env` file in the project root directory with the following content: (This is for reference, update the path for source, cloud and destination)
     ```env
     SOURCE_DIR=C:\Users\Vibhu\Desktop\Projects\tata-ce\project_v3\sourceDir
     CLOUD_DIR=C:\Users\Vibhu\Desktop\Projects\tata-ce\project_v3\cloudDir
