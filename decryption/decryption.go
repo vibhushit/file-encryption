@@ -1,6 +1,7 @@
 package decryption
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"file-encryption/utils"
@@ -8,10 +9,53 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 
 	"github.com/joho/godotenv"
 )
+
+// ScanDirectory scans the given source directory for all its files
+func ScanDirectory(srcDir string, tasks chan<- string) error {
+	defer close(tasks)
+	err := filepath.WalkDir(srcDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			tasks <- path
+		}
+		return nil
+	})
+	return err
+}
+
+// CheckAndDecryptFile checks the integrity of the encrypted file using the hash value stored earlier and then decrypts the file content to a given location
+func CheckAndDecryptFile(srcPath, dstPath string, password []byte, hashStore map[string][]byte) error {
+	// Verify the hash value
+	salt, content, err := readFile(srcPath)
+	if err != nil {
+		return err
+	}
+	encryptedContent := append(salt, content...)
+	hash := utils.ComputeHash(encryptedContent)
+	storedHash, ok := hashStore[srcPath]
+	if !ok {
+		return fmt.Errorf("hash value not found for %s", srcPath)
+	}
+	if !bytes.Equal(hash, storedHash) {
+		return fmt.Errorf("integrity check failed for %s", srcPath)
+	}
+
+	// Decrypt the file
+	err = DecryptFileStream(srcPath, dstPath, password)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Decrypted %s to %s\n", srcPath, dstPath)
+	return nil
+}
 
 func DecryptDirectory(dstDir, password string, hashStore map[string][]byte) error {
 	// Load environment variables from .env file
@@ -26,12 +70,14 @@ func DecryptDirectory(dstDir, password string, hashStore map[string][]byte) erro
 		return fmt.Errorf("CLOUD_DIR environment variable not set")
 	}
 
-	//fmt.Printf("hash store is %v\n", hashStore)
 	var wg sync.WaitGroup
-	tasks := make(chan string)
+	tasks := make(chan string, 100) // Buffered channel to hold file paths
+
+	// Get the number of logical CPUs
+	numWorkers := runtime.NumCPU()
 
 	// Start worker goroutines
-	for i := 0; i < 4; i++ { // Adjust the number of workers as needed
+	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -47,76 +93,100 @@ func DecryptDirectory(dstDir, password string, hashStore map[string][]byte) erro
 					fmt.Printf("Error creating directory: %v\n", err)
 					continue
 				}
-				hash, err := decryptFile(path, dstPath, []byte(password))
+				err = CheckAndDecryptFile(path, dstPath, []byte(password), hashStore)
 				if err != nil {
-					fmt.Printf("Error decrypting file: %v\n", err)
+					fmt.Printf("Error checking and decrypting file: %v\n", err)
 					continue
 				}
-
-				// Verify the hash value
-				// storedHash, ok := hashStore[path]
-				// if !ok {
-				// 	fmt.Printf("Hash value not found for %s\n", path)
-				// 	continue
-				// }
-				// if !bytes.Equal(hash, storedHash) {
-				// 	fmt.Printf("Integrity check for %s\n", path)
-				// 	//continue
-				// }
-
-				fmt.Printf("Decrypted %s to %s\n", path, dstPath)
-				fmt.Printf("Path: %s, Hash: %x\n", path, hash)
 			}
 		}()
 	}
 
-	// Traverse the directory and send tasks to the workers
-	err = filepath.WalkDir(cloudDir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if !d.IsDir() {
-			tasks <- path
-		}
-		return nil
-	})
-	close(tasks)
-	wg.Wait()
-
+	// Scan the directory and send tasks to the workers
+	err = ScanDirectory(cloudDir, tasks)
 	if err != nil {
 		return err
 	}
+
+	wg.Wait()
 	return nil
 }
 
-func decryptFile(srcPath, dstPath string, password []byte) ([]byte, error) {
-	salt, ciphertext, err := readFile(srcPath)
+// DecryptFileStream decrypts a large file in a streaming manner.
+func DecryptFileStream(srcPath, dstPath string, password []byte) error {
+	// Open the source file for reading
+	srcFile, err := os.Open(srcPath)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("error opening source file: %v", err)
 	}
-	//fmt.Printf("Salt: %s\n", hex.EncodeToString(salt))
+	defer srcFile.Close()
 
+	// Open the destination file for writing
+	dstFile, err := os.Create(dstPath)
+	if err != nil {
+		return fmt.Errorf("error creating destination file: %v", err)
+	}
+	defer dstFile.Close()
+
+	// Read the salt from the source file
+	salt := make([]byte, 16)
+	_, err = io.ReadFull(srcFile, salt)
+	if err != nil {
+		return fmt.Errorf("error reading salt: %v", err)
+	}
+
+	// Generate the decryption key
 	key, _, err := utils.GenerateKey(password, salt)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("error generating key: %v", err)
 	}
-	//fmt.Printf("Decryption Key: %s\n", hex.EncodeToString(key))
 
-	//nonce, plaintext, err := decryptContent(ciphertext, key)
-	_, plaintext, err := decryptContent(ciphertext, key)
+	// Read the nonce from the source file
+	nonce := make([]byte, 12)
+	_, err = io.ReadFull(srcFile, nonce)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("error reading nonce: %v", err)
 	}
-	//fmt.Printf("Nonce: %s\n", hex.EncodeToString(nonce))
-	//fmt.Printf("Ciphertext during decryption: %s\n", hex.EncodeToString(ciphertext))
 
-	err = writeFile(dstPath, plaintext)
+	// Create the AES cipher block
+	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("error creating AES cipher block: %v", err)
 	}
 
-	hash := utils.ComputeHash(plaintext)
-	return hash, nil
+	// Create the GCM mode
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return fmt.Errorf("error creating GCM mode: %v", err)
+	}
+
+	// Create a buffer to hold chunks of the file
+	buffer := make([]byte, 1024*1024*100) // 100 MB buffer
+
+	for {
+		// Read a chunk from the source file
+		n, err := srcFile.Read(buffer)
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("error reading from source file: %v", err)
+		}
+		if n == 0 {
+			break
+		}
+
+		// Decrypt the chunk
+		plaintext, err := gcm.Open(nil, nonce, buffer[:n], nil)
+		if err != nil {
+			return fmt.Errorf("error decrypting chunk: %v", err)
+		}
+
+		// Write the decrypted chunk to the destination file
+		_, err = dstFile.Write(plaintext)
+		if err != nil {
+			return fmt.Errorf("error writing to destination file: %v", err)
+		}
+	}
+
+	return nil
 }
 
 func readFile(path string) ([]byte, []byte, error) {
@@ -141,49 +211,4 @@ func readFile(path string) ([]byte, []byte, error) {
 	}
 
 	return salt, content, nil
-}
-
-func writeFile(path string, content []byte) error {
-	file, err := os.Create(path)
-	if err != nil {
-		fmt.Printf("Error creating file: %v\n", err)
-		return err
-	}
-	defer file.Close()
-
-	_, err = file.Write(content)
-	if err != nil {
-		fmt.Printf("Error writing content: %v\n", err)
-		return err
-	}
-	return nil
-}
-
-func decryptContent(content, key []byte) ([]byte, []byte, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		fmt.Printf("Error creating AES cipher block: %v\n", err)
-		return nil, nil, err
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		fmt.Printf("Error creating GCM mode: %v\n", err)
-		return nil, nil, err
-	}
-
-	nonceSize := gcm.NonceSize()
-	if len(content) < nonceSize {
-		fmt.Printf("Ciphertext is too short\n")
-		return nil, nil, fmt.Errorf("ciphertext is too short")
-	}
-	nonce, ciphertext := content[:nonceSize], content[nonceSize:]
-
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		fmt.Printf("Error decrypting ciphertext: %v\n", err)
-		return nil, nil, err
-	}
-
-	return nonce, plaintext, nil
 }
