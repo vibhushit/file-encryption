@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"file-encryption/utils"
 	"fmt"
 	"io"
@@ -30,16 +31,34 @@ func ScanDirectory(srcDir string, tasks chan<- string) error {
 	return err
 }
 
-// ComputeAndStoreHash computes the hash value for the encrypted file and stores it in the hashStore map.
-func ComputeAndStoreHash(filePath string, hashStore map[string][]byte) error {
-	content, err := readFile(filePath)
+// ComputeAndStoreHashStream computes the hash value for the encrypted file in a streaming manner and stores it in the hashStore map.
+func ComputeAndStoreHashStream(filePath string, hashStore map[string][]byte) error {
+	file, err := os.Open(filePath)
 	if err != nil {
 		return err
 	}
-	hash := utils.ComputeHash(content)
+	defer file.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return err
+	}
+
+	hash := hasher.Sum(nil)
 	hashStore[filePath] = hash
 	return nil
 }
+
+// // ComputeAndStoreHash computes the hash value for the encrypted file and stores it in the hashStore map.
+// func ComputeAndStoreHash(filePath string, hashStore map[string][]byte) error {
+// 	content, err := readFile(filePath)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	hash := utils.ComputeHash(content)
+// 	hashStore[filePath] = hash
+// 	return nil
+// }
 
 func EncryptDirectory(srcDir, password string, hashStore map[string][]byte) error {
 	// Load environment variables from .env file
@@ -82,7 +101,7 @@ func EncryptDirectory(srcDir, password string, hashStore map[string][]byte) erro
 					fmt.Printf("Error encrypting file: %v\n", err)
 					continue
 				}
-				err = ComputeAndStoreHash(dstPath, hashStore)
+				err = ComputeAndStoreHashStream(dstPath, hashStore)
 				if err != nil {
 					fmt.Printf("Error computing hash: %v\n", err)
 					continue
@@ -180,15 +199,4 @@ func EncryptFileStream(srcPath, dstPath string, password []byte) error {
 	}
 
 	return nil
-}
-
-func readFile(path string) ([]byte, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		fmt.Printf("Error opening file: %v\n", err)
-		return nil, err
-	}
-	defer file.Close()
-
-	return io.ReadAll(file)
 }

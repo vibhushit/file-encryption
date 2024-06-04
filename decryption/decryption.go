@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/sha256"
 	"file-encryption/utils"
 	"fmt"
 	"io"
@@ -32,13 +33,19 @@ func ScanDirectory(srcDir string, tasks chan<- string) error {
 
 // CheckAndDecryptFile checks the integrity of the encrypted file using the hash value stored earlier and then decrypts the file content to a given location
 func CheckAndDecryptFile(srcPath, dstPath string, password []byte, hashStore map[string][]byte) error {
-	// Verify the hash value
-	salt, content, err := readFile(srcPath)
+	// Verify the hash value in a streaming manner
+	file, err := os.Open(srcPath)
 	if err != nil {
 		return err
 	}
-	encryptedContent := append(salt, content...)
-	hash := utils.ComputeHash(encryptedContent)
+	defer file.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return err
+	}
+
+	hash := hasher.Sum(nil)
 	storedHash, ok := hashStore[srcPath]
 	if !ok {
 		return fmt.Errorf("hash value not found for %s", srcPath)
@@ -187,28 +194,4 @@ func DecryptFileStream(srcPath, dstPath string, password []byte) error {
 	}
 
 	return nil
-}
-
-func readFile(path string) ([]byte, []byte, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		fmt.Printf("Error opening file: %v\n", err)
-		return nil, nil, err
-	}
-	defer file.Close()
-
-	salt := make([]byte, 16)
-	_, err = io.ReadFull(file, salt)
-	if err != nil {
-		fmt.Printf("Error reading salt: %v\n", err)
-		return nil, nil, err
-	}
-
-	content, err := io.ReadAll(file)
-	if err != nil {
-		fmt.Printf("Error reading content: %v\n", err)
-		return nil, nil, err
-	}
-
-	return salt, content, nil
 }
